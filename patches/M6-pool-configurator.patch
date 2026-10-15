@@ -1,0 +1,205 @@
+# M6 — pool_configurator 按主/副布局分叉计价（决定 +82.9% 能否兑现）
+#
+# 文件: srt/model_executor/pool_configurator.py
+# 基线 md5: 759421a89cf087025833e58dbdd98213
+#
+# 前置条件: M1 必须先打（本 patch 复用 M1 的 select_dsv4_kv_layout 结果语义）
+# 依赖: M1
+# 被依赖: 无
+#
+# 为什么必须改（R4 决定性发现）:
+#   pool_configurator.py 全文对 kv_layout 零引用，L989 的 kv_bytes=584 是硬编码
+#   常量 ⇒ 只换布局不改引擎，bpft 不变 ⇒ **容量增益 +0%**。
+#
+# 为什么不能只把 584 改成 528/288:
+#   low_ratio 项对 4 个 kv_source 层用同一个 self.kv_bytes；而 V41 主 + V41_FP4 副下
+#   这 4 层不是同一布局 ⇒ 必须逐层调 resolve_compressed_kv_layout 取字节数。
+#   单常量全填 528 只得 +9.38%；全填 288 会 OOM（3 层 fp8 少算 240 B）。
+#   正确解（逐层）= low 890.0 → bpft 913.54 = +82.89%。
+#
+# 行为保证（默认关闭）:
+#   _dsv4_kv_layout_for_sizing() 读同一组环境变量。默认 "v4" ⇒ _main_layout=V4
+#   ⇒ _main_kv_bytes()/_extra_kv_bytes() 都返回 None ⇒ 回落 self.kv_bytes(=584)
+#   ⇒ 每个计价值与现状逐位相同。
+#
+# ⚠ 2026-10-14 修复一个阻塞级结构 bug（独立审查发现，我的 20 层验证全漏）:
+#   前一版 M6 把 _main_kv_bytes/_extra_kv_bytes 两个方法定义**插在了 __init__ 中间**
+#   （紧跟 self.context_len 之后），导致:
+#     ① __init__ 提前结束，丢 28 个属性赋值（bytes_per_full_token/compression_ratios 等）
+#     ② _extra_kv_bytes 吞掉 __init__ 剩余 195 行，成为 return None 后的死代码
+#     ③ self._main_kv_bytes() 在 layout 赋值之前被调用 ⇒ AttributeError
+#   为什么漏检：py_compile 通过（截断后仍合法 Python）、verify.sh 只 grep 字符串
+#   （死代码里也有）、所有 iso_* 测试用 stub self 从不调用 __init__。
+#   ⇒ 修复：layout 解析移到 __init__ 开头（早于使用）；两个方法定义移到类级别。
+#   ⇒ 新增验证：`_static_order_check.py`（AST 检查赋值早于调用）+ 真正实例化测试。
+#
+# 顺带修正的既有不一致（不改变 V4 数值）:
+#   - bytes_per_swa_token 与 request_window_bytes 定价主池，V41 下改走 swa_kv_bytes
+#   - bpft 的 c4/c128 项定价副池，改走 extra_kv_bytes
+#
+--- a/srt/model_executor/pool_configurator.py
++++ b/srt/model_executor/pool_configurator.py
+@@ -34,11 +34,13 @@
+ )
+ from sglang.srt.environ import envs
+ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
++from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+     get_compress_state_ring_size,
+     get_compress_state_write_pad,
+     get_dsv4_indexer_bytes_per_token,
+     get_swa_ring_size,
++    resolve_compressed_kv_layout,
+ )
+ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+ from sglang.srt.runtime_context import (
+@@ -948,6 +950,27 @@
+     c128_state_pool_size: int
+ 
+ 
++def _dsv4_kv_layout_for_sizing():
++    """The (main layout, compressed-option) the DSV4 pools will be built with.
++
++    Reads the same two environment variables as
++    ``deepseek_v4_memory_pool.select_dsv4_kv_layout`` but never touches the GPU:
++    the configurator runs during profiling, before a device context is
++    guaranteed, and it only needs the layout to price bytes. Any SM100 / SM103
++    / SM121 gate is applied by the pool itself; here the layout simply follows
++    the request, and ``v4`` (the default) keeps today's pricing.
++    """
++    mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
++    option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
++    if mode == "v4":
++        return KVLayout.V4, None if option == "auto" else option
++    if mode == "v41":
++        return KVLayout.V41, option
++    # "auto" leaves the arch choice to the pool's probe; sizing stays on the
++    # conservative V4 constant rather than guessing an SM100-only layout.
++    return KVLayout.V4, None
++
++
+ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+     """Configurator for DSV4 compressed-attention models.
+ 
+@@ -960,6 +983,15 @@
+     def __init__(self, kvc: KVCacheConfigurator):
+         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+         cfg = kvc.model_config
++        # Layout of the pools this configurator prices, resolved exactly the way
++        # DeepSeekV4TokenToKVPool resolves them (deepseek_v4_memory_pool.
++        # select_dsv4_kv_layout + resolve_compressed_kv_layout). None when the
++        # layout is not one of the V4.1 pair, which keeps the V4 pricing.
++        # Resolved first: the kv_bytes split below consults it.
++        self._main_layout, self._compressed_option = _dsv4_kv_layout_for_sizing()
++        self._extra_layout = resolve_compressed_kv_layout(
++            self._main_layout, 1, self._compressed_option
++        )
+         self.qk_nope_head_dim = cfg.qk_nope_head_dim
+         self.qk_rope_head_dim = cfg.qk_rope_head_dim
+         self.indexer_head_dim = cfg.index_head_dim
+@@ -985,8 +1017,18 @@
+             # pool plus a bf16 rope pool.
+             self.kv_bytes = self._unified_row_bytes
+         else:
+-            # One FlashMLA-layout latent slot, in bytes.
++            # One FlashMLA-layout latent slot, in bytes. V4 keeps its rope in
++            # bf16 beside the fp8 nope, so it is wider than the 512-byte payload
++            # it stores; the V4.1 layouts quantize the rope and price exactly
++            # their bytes_per_token (528 fp8 main / 288 fp4 extra).
+             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
++            self.swa_kv_bytes = self._main_kv_bytes()
++            self.extra_kv_bytes = self._extra_kv_bytes()
++        # Fail closed: if the layouts are not the V4 pair the engine knows how
++        # to price, fall back to the single V4 constant rather than under-book.
++        if self.swa_kv_bytes is None or self.extra_kv_bytes is None:
++            self.swa_kv_bytes = self.kv_bytes
++            self.extra_kv_bytes = self.kv_bytes
+         # HIP takes the FP4-accurate byte count here. The NVIDIA FP4 path
+         # keeps the FP8 estimate.
+         self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
+@@ -1048,8 +1090,26 @@
+         low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
+             self.indexer_head_dim, use_fp4_indexer=True
+         )
++        # Price each ratio-1/2 source layer with the bytes its own cache uses:
++        # the pool builds every low-ratio latent pool with
++        # compressed_kv_layout(ratio), so a ratio-2 layer next to a V41 main is
++        # V41 (528 B) unless the fp4 option forces V41_FP4 (288 B), while the
++        # ratio-1 layer follows resolve_compressed_kv_layout(1). One scalar
++        # cannot express that split (528*1.5 + 288*1.0 != 528*2.5), which is
++        # why this term used to be the only place a V41 pool was over-priced.
++        def _low_ratio_layer_bytes(ratio: int) -> int:
++            layout = resolve_compressed_kv_layout(
++                self._main_layout, ratio, self._compressed_option
++            )
++            if layout is KVLayout.V41_FP4:
++                return self.extra_kv_bytes
++            if layout is KVLayout.V41:
++                return self.swa_kv_bytes
++            return self.kv_bytes
++
+         self.low_ratio_bytes_per_full_token = sum(
+-            (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
++            (_low_ratio_layer_bytes(cfg.compress_ratios[l]) + low_ratio_index_bytes)
++            / cfg.compress_ratios[l]
+             for l in cfg.hf_config.kv_source_layer_ids
+             if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+             and cfg.compress_ratios[l] in (1, 2)
+@@ -1170,6 +1230,29 @@
+                 logger.info(
+                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
+                 )
++
++    def _main_kv_bytes(self) -> Optional[int]:
++        """Bytes per SWA (main) token, or None to keep the V4 constant."""
++        if self._main_layout is KVLayout.V41:
++            return KVLayout.V41.bytes_per_token  # 528
++        return None
++
++    def _extra_kv_bytes(self) -> Optional[int]:
++        """Bytes per compressed (extra) latent token, or None for V4.
++
++        Only the (V41 main, V41_FP4 extra) pair changes the extra price: 288
++        instead of 584. A V41 main with fp8 extras stays at 528.
++
++        ``None`` means "the V4 constant applies" and is only correct when the
++        main cache is V4. Returning it for a V41 main with fp8 extras would
++        trip the fail-closed fallback below and re-price BOTH pools at 584,
++        which is exactly the over-booking this split exists to remove.
++        """
++        if self._extra_layout is KVLayout.V41_FP4:
++            return KVLayout.V41_FP4.bytes_per_token  # 288
++        if self._extra_layout is KVLayout.V41:
++            return KVLayout.V41.bytes_per_token      # 528 (V41 main + fp8 extras)
++        return None
+ 
+     def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
+         """A verify batch writes its whole optimistic tail into the ring, so ring
+@@ -1246,14 +1329,14 @@
+         if self.encoder_replay:
+             # Target SWA lives in the fixed request window; only the draft owns
+             # paged SWA bytes. DSpark's draft layers have no compressed state.
+-            return self.kv_bytes * self.paged_draft_layers
++            return self.swa_kv_bytes * self.paged_draft_layers
+         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
+         c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
+         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
+ 
+         c4_state_ratio = self.c4_ring_size / self.swa_page_size
+         return (
+-            self.kv_bytes * self.num_layers_total
++            self.swa_kv_bytes * self.num_layers_total
+             + c4_state_ratio
+             * (c4_state_bytes + c4_indexer_state_bytes)
+             * self.num_layers_ca4
+@@ -1285,8 +1368,8 @@
+         return (
+             swa_ratio * self.bytes_per_swa_token
+             + self.low_ratio_bytes_per_full_token
+-            + c4_frac * self.kv_bytes * self.num_layers_ca4
+-            + 1 / 128 * self.kv_bytes * self.num_layers_ca128
++            + c4_frac * self.extra_kv_bytes * self.num_layers_ca4
++            + 1 / 128 * self.extra_kv_bytes * self.num_layers_ca128
+             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
+             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
+         )
