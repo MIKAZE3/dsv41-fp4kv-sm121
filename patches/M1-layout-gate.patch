@@ -1,0 +1,83 @@
+# M1 — 让 SM121 (GB10) 能选 V41 主缓存（总开关）
+#
+# 文件: srt/mem_cache/deepseek_v4_memory_pool.py
+# 位置: L121-163（flashmla_supports_v41_kv_layouts + select_dsv4_kv_layout）
+# 基线 md5: f0dfef3445661680ee1469be1f761ec9
+#
+# 前置条件: 无（第一个打）
+# 依赖: 无
+# 被依赖: M2 必须也打（M1 引用 M2 新增的 flash_mla_sm120_supports_v41_kv_layouts）
+#         M3/M4 必须也打（否则 V41 cache 仍被当 584B 硬解码）
+#
+# 行为保证（默认关闭）:
+#   SGLANG_DSV4_KV_LAYOUT 默认 "v4"（environ.py:1473）。mode == "v4" 时
+#   select_dsv4_kv_layout() 在 mode 分支就 return，永远走不到本 patch 新增的
+#   SM121 分支 ⇒ 不设环境变量时行为与现状逐位一致。
+#   mode == "auto" 时 SM121 分支只在探测成功时选 V41；SM100/SM103 与 SM90
+#   的判定路径一字未改。
+#
+# 红线: 只放开"选布局"，不动任何权重/训练路径。
+
+--- a/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -122,6 +122,22 @@
+     """Whether the installed FlashMLA decode kernel reads the 528-byte (V41) and
+     288-byte (V41_FP4) formats: it documents the bytes-per-token detection in
+     the docstring of ``flash_mla_with_kvcache``."""
++    # SM121 (GB10) never loads the prebuilt flashmla_ops.so -- its cubins only
++    # carry sm_90a / sm_100 / sm_103a -- and routes every forward mode through
++    # flash_mla_with_kvcache_sm120 instead, so the docstring probe below answers
++    # a question with no meaning here. Ask the sm120 path itself: it reads the
++    # layout from the last dim of the (pages, page_size, 1, bytes) view, which
++    # the pool derives from KVLayout.
++    if (
++        torch.cuda.is_available()
++        and torch.version.cuda is not None
++        and torch.cuda.get_device_capability()[:2] == (12, 1)
++    ):
++        from sglang.kernels.ops.attention.flash_mla_sm120 import (
++            flash_mla_sm120_supports_v41_kv_layouts,
++        )
++
++        return flash_mla_sm120_supports_v41_kv_layouts()
+     try:
+         from sgl_kernel.flash_mla import flash_mla_with_kvcache
+     except Exception:
+@@ -138,12 +154,37 @@
+     ``v41`` raises elsewhere, ``auto`` picks them on SM100 / SM103 when the
+     installed FlashMLA advertises them and stays on ``v4`` otherwise (SM90 and
+     SM120 always keep the 584-byte V4 layout).
++
++    SM121 (GB10) is a distinct consumer-Blackwell minor: capability (12, 1).
++    Its decode path reads the same V4.1 formats, so the same layouts are offered
++    there once that path advertises them.
+     """
+     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
+     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+     if mode == "v4":
+         return KVLayout.V4, None if option == "auto" else option
+     assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
++    # Match the (major, minor) pair directly. get_platform().is_sm120 is True on
++    # SM121 because it probes is_sm120_supported (major only), while
++    # utils.common's bare is_sm120() is (12, 0) exactly and is False; comparing
++    # the capability tuple avoids depending on either name.
++    if (
++        torch.cuda.is_available()
++        and torch.version.cuda is not None
++        and torch.cuda.get_device_capability()[:2] == (12, 1)
++    ):
++        supported = flashmla_supports_v41_kv_layouts()
++        if mode == "auto" and not supported:
++            # Fail closed exactly like the SM100 branch: an unpatched sm120
++            # kernel still reads the 584-byte layout only.
++            return KVLayout.V4, None
++        if mode == "v41" and not supported:
++            logger.warning(
++                "SGLANG_DSV4_KV_LAYOUT=v41 on SM121 but the sm120 attention path "
++                "does not advertise the V4.1 KV cache formats; the attention "
++                "kernel will reject the cache."
++            )
++        return KVLayout.V41, option
+     is_sm100 = (
+         torch.cuda.is_available()
+         and torch.version.cuda is not None
