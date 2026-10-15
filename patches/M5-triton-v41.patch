@@ -1,0 +1,420 @@
+# M5-Triton — 给 Triton decode 后端架接 V41 / V41_FP4 支持
+#
+# 文件: kernels/ops/attention/flash_mla_sm120_triton.py
+# 基线 md5: bb1682dd23aeeb6f30c766d3168957a0
+#
+# 前置条件: 无（可独立于 M1/M2/M3+M4/M6 打；但只有配 SGLANG_DSV4_KV_LAYOUT=v41
+#           且 SGLANG_SM120_FLASHMLA_BACKEND=triton 才会走到新分支）
+# 依赖: 无
+# 被依赖: 无（生产路径的最后一环）
+#
+# 方案选型（已读 _tiled_sparse_decode_kernel L52-203 verbatim 后定夺）:
+#   选 (b) constexpr 分支；否掉 (a) 伪 paged 与 (c) 往返量化。
+#   - (a) 数学不可行：kernel data 区 576B（448 fp8 + 128B bf16 rope），rope 从
+#     `token_data_bases + 448` 无条件读；反量化后的 bf16 latent 需 1024B > 576B，
+#     且不炸 rope 读取就无法绕过 ⇒ 绕不过去就得加 constexpr，那正是 (b)。
+#   - (c) 往返量化：把 V41 反量化再按假 V4 页（448 fp8 + 128B bf16 rope +
+#     8B scale=1.0）写回，让原 kernel 读。代价是每 token 一次 bf16→fp8 二次圆整
+#     + 584B/token 写入，纯损耗；且 V41 的 rope 本就是 fp8，往返反而丢精度。
+#   - (b) 只参数化 5 处硬编码，V4 路径 constexpr=False 时与原代码逐位相同。
+#
+# 参数化的 5 处（其余 Q load / online softmax / V 累加 / LSE 与布局无关）:
+#   L137 data stride  576 -> 512(V41) / 256(V41_FP4)
+#   L149 scale stride   8 -> 16 / 32
+#   L160 rope region  448 -> 无（V4.1 把 rope 量化进 data）
+#   L116 scale group  //64 -> //32 / //16
+#   L156 scale decode exp2(u-127) -> e4m3 直读(FP4)
+#
+# 数值规则与上游 Triton kernel 逐位一致（可直接对照）:
+#   _ue8m0_to_f32  <- dequant_k_cache.py:349 _ue8m0_to_fp32（byte 0 = 2^-127 denormal，
+#                     注意：这与 M2 torch 路径的 2^-126 不同，见下方"已知差异"）
+#   _e2m1_code_to_f32 <- dequant_k_cache.py:362 _e2m1_code_to_fp32
+#   fp4 scale 索引 (2*boffs)//16 <- dequant_k_cache.py:436
+#
+# 行为保证（默认关闭）:
+#   bpt != 528/288 时断言 bpt == 584 且 IS_V41=False，kernel 走原始 V4 分支，
+#   data/scale stride 与 group 全部取 V4 常量 ⇒ V4 输出与 patch 前逐位相同。
+#
+# ⚠ 已裁决的数值分歧（2026-10-14 Lead 复核，原警告已作废）:
+#   原警告称"torch fallback（M2）用 2^-126，本 patch 用 2^-127，两者不保证 bit-exact"。
+#   Lead 已核对上游权威规则：dequant_k_cache.py:349-358 `_ue8m0_to_fp32` 的
+#   **docstring 与代码一致地规定 byte 0 = denormal 2^-127**
+#   （`denormal = tl.full(..., 0x00400000, tl.int32)`，且注明 "as
+#   torch.float8_e8m0fnu converts them"）。
+#   ⇒ 2^-126 是**参考实现 v41_ref_impl.py 的早期笔误**，已修正为 2^-127。
+#   ⇒ M2（torch）与 M5（Triton）现在都对齐上游 2^-127，**不存在分歧**。
+#   Lead 复核结果：V41 与参考实现 bit-exact ndiff=0、V41_FP4 bit-exact ndiff=0、
+#   V4 回归 bit-exact ndiff=0（修正前 V41 的 31/8192 差异即源于该笔误）。
+
+--- a/kernels/ops/attention/flash_mla_sm120_triton.py
++++ b/kernels/ops/attention/flash_mla_sm120_triton.py
+@@ -24,6 +24,8 @@
+ import torch
+ import triton
+ import triton.language as tl
++
++from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -35,6 +37,18 @@
+ _D = _NOPE_DIM + _ROPE_DIM  # 512
+ _TOKEN_DATA_STRIDE = 576  # bytes per token in data section
+ _SCALE_STRIDE = 8  # bytes per token in scale section
++
++# The V4.1 formats this kernel can also read, as (data stride, scale stride,
++# values per scale, has a separate bf16 rope region). V4 keeps its rope beside
++# the nope values in bf16; the V4.1 layouts quantize it into the data region,
++# so they have no rope region at all and every one of the 512 output values
++# comes from the data region.
++#   V4     : 576 B data (448 fp8 + 128 B bf16 rope), 8 B scale, 64 vals/scale
++#   V41    : 512 B data (512 fp8),               16 B scale, 32 vals/scale
++#   V41_FP4: 256 B data (512 e2m1, 2 per byte),   32 B scale, 16 vals/scale
++_V41_DATA_STRIDE = {KVLayout.V41: 512, KVLayout.V41_FP4: 256}
++_V41_SCALE_STRIDE = {KVLayout.V41: 16, KVLayout.V41_FP4: 32}
++_V41_VALUES_PER_SCALE = {KVLayout.V41: 32, KVLayout.V41_FP4: 16}
+ 
+ 
+ @triton.autotune(
+@@ -80,12 +94,24 @@
+     ROPE_DIM: tl.constexpr,  # 64
+     NOPE_DIM_RT: tl.int32,  # 448 (runtime, for masking)
+     BLOCK_T: tl.constexpr,  # tokens per tile (16 or 32)
++    # V4.1 support. IS_V41=False keeps the original V4 path exactly. When True,
++    # DATA_STRIDE / SCALE_STRIDE / VALS_PER_SCALE describe the V4.1 page and
++    # IS_FP4 selects the e2m1 payload with e4m3 scales over fp8 with ue8m0.
++    IS_V41: tl.constexpr,
++    IS_FP4: tl.constexpr,
++    DATA_STRIDE: tl.constexpr,
++    SCALE_STRIDE: tl.constexpr,
++    VALS_PER_SCALE: tl.constexpr,
+ ):
+     """Tiled sparse decode: vectorized gather + QK + softmax + V accumulation.
+ 
+     Grid: (B, H) — one block per (batch, head) pair.
+     Each block processes all topk tokens in tiles of BLOCK_T.
+     """
++    # V4.1 has exactly two shapes: V41 (IS_V41, fp8 payload + ue8m0 scales) and
++    # V41_FP4 (both, e2m1 payload + e4m3 scales). IS_FP4 without IS_V41 is not a
++    # layout and would silently read e4m3 scales over an fp8 page.
++    tl.static_assert(IS_V41 or not IS_FP4, "IS_FP4 requires IS_V41")
+     bid = tl.program_id(0)
+     hid = tl.program_id(1)
+ 
+@@ -95,10 +121,17 @@
+     nope_mask = nope_offs < NOPE_DIM_RT  # [512], True for [0:448]
+     rope_offs = tl.arange(0, ROPE_DIM)  # [64]
+ 
+-    q_nope = tl.load(Q_ptr + q_base + nope_offs, mask=nope_mask, other=0.0)
+-    q_nope = q_nope.to(tl.float32) * sm_scale
+-    q_rope = tl.load(Q_ptr + q_base + NOPE_DIM_RT + rope_offs)
+-    q_rope = q_rope.to(tl.float32) * sm_scale
++    # V4.1 quantizes the rope into the data region, so all 512 query values are
++    # one contiguous fp8-region read and there is no separate rope load. The
++    # full-width load is masked to NOPE_DIM_RT on the V4 path only.
++    if IS_V41:
++        q_all = tl.load(Q_ptr + q_base + nope_offs).to(tl.float32) * sm_scale
++    else:
++        q_nope = tl.load(Q_ptr + q_base + nope_offs, mask=nope_mask, other=0.0).to(
++            tl.float32
++        ) * sm_scale
++        q_rope = tl.load(Q_ptr + q_base + NOPE_DIM_RT + rope_offs)
++        q_rope = q_rope.to(tl.float32) * sm_scale
+ 
+     # ---- Valid token count ----
+     valid_topk = topk
+@@ -111,9 +144,22 @@
+     l_i: tl.float32 = 0.0
+     acc_nope = tl.zeros([NOPE_PAD], dtype=tl.float32)
+     acc_rope = tl.zeros([ROPE_DIM], dtype=tl.float32)
++    # V4.1 accumulates all 512 values in one register block (no rope split).
++    acc_all = tl.zeros([NOPE_PAD], dtype=tl.float32)
+ 
+     # ---- Precompute constant index vectors ----
+-    group_ids = (nope_offs // 64).to(tl.int64)  # [NOPE_PAD], scale group for each dim
++    # V4: 7 groups of 64 values, ue8m0 scale byte per group.
++    # V41: 16 groups of 32 values. V41_FP4: 32 groups of 16 values.
++    # The upstream fp4 kernel indexes the scale by BYTE, not by value:
++    # ``(2 * boffs) // TILE_SIZE`` (dequant_k_cache.py:436), and since
++    # ``boffs == value_index // 2`` that is ``value_index // TILE_SIZE`` -- the
++    # same "values per scale" grouping the fp8 path uses. (An earlier draft of
++    # this patch used ``value_index // (2 * TILE)``, which is off by 2x and
++    # reads the neighbouring group's scale; caught by the addressing test.)
++    if IS_V41:
++        group_ids = (nope_offs // VALS_PER_SCALE).to(tl.int64)
++    else:
++        group_ids = (nope_offs // 64).to(tl.int64)
+     t_offs = tl.arange(0, BLOCK_T)  # [BLOCK_T], token offsets within tile
+ 
+     # ---- Process tokens in tiles of BLOCK_T ----
+@@ -134,43 +180,114 @@
+         safe_indices = tl.where(idx_valid, raw_indices, tl.zeros_like(raw_indices))
+         page_ids = (safe_indices // page_size).to(tl.int64)
+         page_offs_t = (safe_indices % page_size).to(tl.int64)
+-        token_data_bases = page_ids * page_bytes + page_offs_t * 576  # [BLOCK_T] int64
+-
+-        # ---- Vectorized NOPE FP8 gather: [BLOCK_T, NOPE_PAD] ----
+-        nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
+-        nope_2d_mask = idx_valid[:, None] & nope_mask[None, :]
+-        kv_nope_fp8 = tl.load(
+-            cache_fp8_ptr + nope_addrs,
+-            mask=nope_2d_mask,
+-            other=0.0,
+-        )
+-
+-        # ---- Vectorized scale gather + dequant: [BLOCK_T, NOPE_PAD] ----
+-        scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * 8
+-        scale_addrs = scale_bases[:, None] + group_ids[None, :]
+-        scale_raw = tl.load(
+-            cache_uint8_ptr + scale_addrs,
+-            mask=nope_2d_mask,
+-            other=127,
+-        )
+-        scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
+-        kv_nope = tl.where(nope_2d_mask, kv_nope_fp8.to(tl.float32) * scale_f32, 0.0)
+-
+-        # ---- Vectorized ROPE BF16 gather: [BLOCK_T, ROPE_DIM] ----
+-        rope_byte_bases = token_data_bases + 448
+-        rope_elem_bases = (rope_byte_bases // 2).to(tl.int64)
+-        rope_addrs = rope_elem_bases[:, None] + rope_offs[None, :].to(tl.int64)
+-        kv_rope = tl.load(
+-            cache_bf16_ptr + rope_addrs,
+-            mask=idx_valid[:, None],
+-            other=0.0,
+-        ).to(tl.float32)
++        # V4.1 pages are DATA_STRIDE bytes wide (512 fp8 / 256 packed e2m1) and
++        # carry no separate rope region; V4 stays at the 576-byte stride.
++        token_data_bases = (
++            page_ids * page_bytes + page_offs_t * DATA_STRIDE
++        )  # [BLOCK_T] int64
++
++        if IS_V41:
++            # ---- V4.1: one contiguous payload region, no rope split ----
++            # A value's byte offset inside the token: fp8 is one byte per value,
++            # fp4 packs two values per byte.
++            if IS_FP4:
++                val_byte_offs = (nope_offs // 2).to(tl.int64)
++            else:
++                val_byte_offs = nope_offs.to(tl.int64)
++            nope_addrs = token_data_bases[:, None] + val_byte_offs[None, :]
++            nope_2d_mask = idx_valid[:, None]
++            # The fp8 payload is read through the fp8 view so the cast to fp32 is a
++            # native fp8->fp32 conversion; the packed e2m1 payload needs the raw
++            # bytes, which is what the uint8 view provides. Keeping the two loads
++            # separate also keeps the V4 path's fp8 read unchanged.
++            if IS_FP4:
++                payload = tl.load(
++                    cache_uint8_ptr + nope_addrs,
++                    mask=nope_2d_mask,
++                    other=0,
++                )
++                # Even value = low nibble, odd value = high nibble, both sharing
++                # the e4m3 scale of their 16-value group.
++                nib = tl.where((nope_offs % 2) == 0, payload & 0xF, payload >> 4)
++                kv_nope = _e2m1_code_to_f32(nib)
++            else:
++                payload_f8 = tl.load(
++                    cache_fp8_ptr + nope_addrs,
++                    mask=nope_2d_mask,
++                    other=0.0,
++                )
++                kv_nope = payload_f8.to(tl.float32)
++
++            scale_bases = (
++                page_ids * page_bytes + scale_section_off + page_offs_t * SCALE_STRIDE
++            )
++            scale_addrs = scale_bases[:, None] + group_ids[None, :]
++            if IS_FP4:
++                # e4m3 scale: read through the fp8 view so the conversion is a
++                # native fp8->fp32 cast (a uint8 load would be 1 byte wide and
++                # cannot be bitcast to fp32).
++                scale_raw = tl.load(
++                    cache_fp8_ptr + scale_addrs,
++                    mask=nope_2d_mask,
++                    other=0.0,
++                )
++                scale_f32 = scale_raw.to(tl.float32)
++            else:
++                # ue8m0 scale: 2**(byte-127), byte 0 the denormal, 255 NaN.
++                # It is a raw exponent byte, so it stays on the uint8 view.
++                scale_raw = tl.load(
++                    cache_uint8_ptr + scale_addrs,
++                    mask=nope_2d_mask,
++                    other=127,
++                )
++                scale_f32 = _ue8m0_to_f32(scale_raw)
++            kv_all = tl.where(nope_2d_mask, kv_nope * scale_f32, 0.0)
++            kv_rope = kv_all  # no separate rope region
++        else:
++            # ---- Vectorized NOPE FP8 gather: [BLOCK_T, NOPE_PAD] ----
++            nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
++            nope_2d_mask = idx_valid[:, None] & nope_mask[None, :]
++            kv_nope_fp8 = tl.load(
++                cache_fp8_ptr + nope_addrs,
++                mask=nope_2d_mask,
++                other=0.0,
++            )
++
++            # ---- Vectorized scale gather + dequant: [BLOCK_T, NOPE_PAD] ----
++            scale_bases = (
++                page_ids * page_bytes + scale_section_off + page_offs_t * SCALE_STRIDE
++            )
++            scale_addrs = scale_bases[:, None] + group_ids[None, :]
++            scale_raw = tl.load(
++                cache_uint8_ptr + scale_addrs,
++                mask=nope_2d_mask,
++                other=127,
++            )
++            scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
++            kv_nope = tl.where(
++                nope_2d_mask, kv_nope_fp8.to(tl.float32) * scale_f32, 0.0
++            )
++            kv_all = kv_nope
++
++            # ---- Vectorized ROPE BF16 gather: [BLOCK_T, ROPE_DIM] ----
++            rope_byte_bases = token_data_bases + 448
++            rope_elem_bases = (rope_byte_bases // 2).to(tl.int64)
++            rope_addrs = rope_elem_bases[:, None] + rope_offs[None, :].to(tl.int64)
++            kv_rope = tl.load(
++                cache_bf16_ptr + rope_addrs,
++                mask=idx_valid[:, None],
++                other=0.0,
++            ).to(tl.float32)
+ 
+         # ---- Vectorized QK scores: [BLOCK_T] ----
+-        # scores[t] = dot(q_nope, kv_nope[t]) + dot(q_rope, kv_rope[t])
+-        scores = tl.sum(q_nope[None, :] * kv_nope, axis=1) + tl.sum(
+-            q_rope[None, :] * kv_rope, axis=1
+-        )
++        # V4: dot(q_nope, kv_nope) + dot(q_rope, kv_rope) over two regions.
++        # V4.1: one 512-wide dot, the rope already being inside the payload.
++        if IS_V41:
++            scores = tl.sum(q_all[None, :] * kv_all, axis=1)
++        else:
++            scores = tl.sum(q_nope[None, :] * kv_nope, axis=1) + tl.sum(
++                q_rope[None, :] * kv_rope, axis=1
++            )
+         scores = tl.where(idx_valid, scores, -1e30)
+ 
+         # ---- Online softmax update (base-2, tile-level) ----
+@@ -185,24 +302,62 @@
+         l_i = l_i * alpha + tl.sum(p)
+ 
+         # ---- Vectorized V accumulation (K=V in MLA) ----
+-        # acc += sum_t(p[t] * kv[t, :]) for both nope and rope
+-        acc_nope = acc_nope * alpha + tl.sum(p[:, None] * kv_nope, axis=0)
+-        acc_rope = acc_rope * alpha + tl.sum(p[:, None] * kv_rope, axis=0)
++        # V4.1 has a single 512-wide accumulator; V4 keeps the two-region split
++        # so its accumulation order -- and therefore its rounding -- is unchanged.
++        if IS_V41:
++            acc_all = acc_all * alpha + tl.sum(p[:, None] * kv_all, axis=0)
++        else:
++            acc_nope = acc_nope * alpha + tl.sum(p[:, None] * kv_nope, axis=0)
++            acc_rope = acc_rope * alpha + tl.sum(p[:, None] * kv_rope, axis=0)
+         m_i = m_new
+ 
+     # ---- Normalize output ----
+     safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+-    acc_nope = acc_nope / safe_l
+-    acc_rope = acc_rope / safe_l
++    if IS_V41:
++        acc_all = acc_all / safe_l
++    else:
++        acc_nope = acc_nope / safe_l
++        acc_rope = acc_rope / safe_l
+ 
+     # LSE: convert from log2 back to natural log
+     lse = tl.where(l_i > 0.0, m_i / LOG2E + tl.math.log(safe_l), float("-inf"))
+ 
+     # ---- Store output ----
+     o_base = bid * stride_ob + hid * stride_oh
+-    tl.store(O_ptr + o_base + nope_offs, acc_nope.to(tl.bfloat16), mask=nope_mask)
+-    tl.store(O_ptr + o_base + NOPE_DIM_RT + rope_offs, acc_rope.to(tl.bfloat16))
++    if IS_V41:
++        tl.store(O_ptr + o_base + nope_offs, acc_all.to(tl.bfloat16))
++    else:
++        tl.store(O_ptr + o_base + nope_offs, acc_nope.to(tl.bfloat16), mask=nope_mask)
++        tl.store(
++            O_ptr + o_base + NOPE_DIM_RT + rope_offs, acc_rope.to(tl.bfloat16)
++        )
+     tl.store(LSE_ptr + bid * H + hid, lse)
++
++
++@triton.jit
++def _ue8m0_to_f32(scale_u8):
++    """The ue8m0 byte as fp32: ``2 ** (byte - 127)``, byte 0 the denormal and
++    255 NaN -- identical to ``dequant_k_cache._ue8m0_to_fp32``."""
++    normal = (scale_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++    denormal = tl.full(scale_u8.shape, 0x00400000, tl.int32).to(
++        tl.float32, bitcast=True
++    )
++    scale = tl.where(scale_u8 == 0, denormal, normal)
++    return tl.where(scale_u8 == 255, float("nan"), scale)
++
++
++@triton.jit
++def _e2m1_code_to_f32(code):
++    """The 4-bit e2m1 code as fp32, identical to
++    ``dequant_k_cache._e2m1_code_to_fp32``: bit 3 sign, bits 0-2 index into
++    ``[0, 0.5, 1, 1.5, 2, 3, 4, 6]``. The sign is OR-ed into the float32 sign
++    bit so a negated zero stays -0.0 (code 0x8)."""
++    m = code & 7
++    e = m >> 1
++    f = (m & 1).to(tl.float32)
++    mag = tl.where(e == 0, 0.5 * f, tl.exp2((e - 1).to(tl.float32)) * (1.0 + 0.5 * f))
++    sign = (code & 8).to(tl.int32) << 28
++    return (mag.to(tl.int32, bitcast=True) | sign).to(tl.float32, bitcast=True)
+ 
+ 
+ def _run_triton_sparse_decode(
+@@ -217,6 +372,29 @@
+     num_pages = k_cache.shape[0]
+     page_size = k_cache.shape[1]
+     page_bytes = k_cache.stride(0)  # elements = bytes for float8
++    # The reader contract (kv_layout.py): the view's last dim identifies the
++    # format. 584 / 528 / 288 are distinct, so the layout needs no extra
++    # plumbing from the caller. V4 keeps the original code path untouched.
++    bpt = k_cache.shape[-1]
++    if bpt == KVLayout.V41.bytes_per_token:
++        v41_layout, is_v41, is_fp4 = KVLayout.V41, True, False
++    elif bpt == KVLayout.V41_FP4.bytes_per_token:
++        v41_layout, is_v41, is_fp4 = KVLayout.V41_FP4, True, True
++    else:
++        assert bpt == KVLayout.V4.bytes_per_token, (
++            f"unsupported DSV4 KV cache bytes-per-token {bpt}; expected 584 (V4), "
++            "528 (V41) or 288 (V41_FP4)"
++        )
++        v41_layout, is_v41, is_fp4 = KVLayout.V4, False, False
++    data_stride = (
++        _V41_DATA_STRIDE[v41_layout] if is_v41 else _TOKEN_DATA_STRIDE
++    )
++    scale_stride = (
++        _V41_SCALE_STRIDE[v41_layout] if is_v41 else _SCALE_STRIDE
++    )
++    vals_per_scale = (
++        _V41_VALUES_PER_SCALE[v41_layout] if is_v41 else 64
++    )
+ 
+     # Flatten indices to [B, topk]
+     flat_indices = indices.reshape(B, -1).contiguous()
+@@ -260,7 +438,7 @@
+         softmax_scale,
+         page_size,
+         int(page_bytes),  # page_bytes (int64)
+-        int(page_size * _TOKEN_DATA_STRIDE),  # scale_section_off (int64)
++        int(page_size * data_stride),  # scale_section_off (int64)
+         H,
+         topk,
+         topk_rounded,
+@@ -273,6 +451,11 @@
+         NOPE_PAD=512,
+         ROPE_DIM=_ROPE_DIM,
+         NOPE_DIM_RT=_NOPE_DIM,
++        IS_V41=is_v41,
++        IS_FP4=is_fp4,
++        DATA_STRIDE=data_stride,
++        SCALE_STRIDE=scale_stride,
++        VALS_PER_SCALE=vals_per_scale,
+     )
+ 
+     # Return [B, 1, H, D] and [B, 1, H]
