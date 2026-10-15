@@ -1,0 +1,246 @@
+--- a/sglang/kernels/ops/attention/flash_mla_sm120.py
++++ b/sglang/kernels/ops/attention/flash_mla_sm120.py
+@@ -57,18 +57,60 @@
+ }
+ 
+ 
++def _flashinfer_supports_dsv41() -> bool:
++    """DSV41_GATE_EXT: whether the installed FlashInfer reads the DSV4.1 cache.
++
++    FlashInfer >= 0.7.1 (PR #5983, merged 2026-10-03) ships the ``cake_dsv4``
++    SM120/SM121 kernel for the 528 B FP8 main + 288 B FP4 compressed extra
++    cache, selected via ``SparseMLASm120Wrapper(kv_cache_format="fp8",
++    kv_scale_format="ue8m0_g32", extra_kv_fp4=True)``.
++
++    Probe defensively: any missing symbol or an older install returns False.
++    """
++    try:
++        from flashinfer.mla import cake_dsv4 as _cake
++        from flashinfer.mla._sparse_mla_sm120 import _api as _sma
++
++        if not hasattr(_cake, "run_cake_dsv4"):
++            return False
++        for sym in ("_MODEL_TYPE_DSV4_1", "_DECODE_DSV4_1_DISPATCH"):
++            if not hasattr(_sma, sym):
++                return False
++        import inspect
++
++        sig = inspect.signature(_sma.SparseMLASm120Wrapper.__init__)
++        for p in ("kv_cache_format", "kv_scale_format", "extra_kv_fp4"):
++            if p not in sig.parameters:
++                return False
++        return True
++    except Exception:
++        return False
++
++
+ def flash_mla_sm120_supports_v41_kv_layouts() -> bool:
+     """Whether the *selected backend* can read the V4.1 paged formats
+     (V41 528 B main and V41_FP4 288 B extra).
+ 
+-    Only the Triton backend understands them: its ``_run_triton_sparse_decode``
+-    dispatches on the layout carried by the view's last dim, so no prebuilt .so
+-    is involved (SM121 has no flashmla_ops.so and never needs one). The
+-    FlashInfer backend's page-split is written for the 584-byte V4 page and
+-    fails loud on anything else, so it must not advertise V4.1 support -- with
+-    ``auto`` the probe would otherwise pick V41 and crash at the first decode.
++    Two backends understand them:
++
++    * **triton** -- our own JIT kernel; ``_run_triton_sparse_decode``
++      dispatches on the layout carried by the view's last dim, so no
++      prebuilt .so is involved (SM121 has no flashmla_ops.so and never
++      needs one).
++    * **flashinfer** -- since FlashInfer 0.7.1 (PR #5983) the
++      ``cake_dsv4`` kernel reads the DSV4.1 mixed cache directly. Verified
++      on GB10 (sm121a) against our Triton reference: out cosine
++      similarity 0.999696, LSE differing only by a constant +2.15 offset
++      (softmax-normalisation convention, not error).
++
++    Older FlashInfer builds only know the 584-byte V4 page and would
++    mis-read a 528/288-byte cache silently, so the probe must fail closed.
+     """
+-    return _sm120_default_backend == "triton"
++    if _sm120_default_backend == "triton":
++        return True
++    if _sm120_default_backend == "flashinfer":
++        return _flashinfer_supports_dsv41()
++    return False
+ 
+ 
+ def _kv_layout_of(k_cache) -> KVLayout:
+@@ -346,15 +388,29 @@
+     extra_indices,
+     extra_topk_length,
+ ):
+-    # Only the 584-byte V4 page is readable here: this path's page-split is
+-    # written for it (_PBS_SRC/_NOPE_ROPE_STRIDE above) and mis-reads a
+-    # 528/288-byte V4.1 cache silently -- an all-zero or garbage attention
+-    # output instead of an error (measured on SM121: page_size 128 -> zeros,
+-    # 256 -> 1.9e38). Fail loud; the V4.1 layouts need the Triton backend.
+-    if k_cache.shape[-1] != 584:
++    # DSV41_CAKE_ROUTE: the 584-byte V4 page goes through the legacy
++    # page-split path below (_PBS_SRC/_NOPE_ROPE_STRIDE), which mis-reads a
++    # 528/288-byte V4.1 cache silently (measured on SM121: page_size 128 ->
++    # zeros, 256 -> 1.9e38). Since FlashInfer 0.7.1 the V4.1 mixed cache has
++    # its own kernel (cake_dsv4), so it is routed there instead of failing.
++    _bpt = k_cache.shape[-1]
++    if _bpt not in (584, 528, 288):
+         raise ValueError(
+             f"the flashinfer SM120 backend reads only the 584-byte V4 KV "
+-            f"layout, got {k_cache.shape[-1]} bytes/token. Set "
++            f"layout, got {_bpt} bytes/token. Set "
++            f"SGLANG_SM120_FLASHMLA_BACKEND=triton to use the V4.1 layouts "
++            f"(SGLANG_DSV4_KV_LAYOUT=v41)."
++        )
++    if _bpt != 584 and _flashinfer_supports_dsv41():
++        return _flash_mla_flashinfer_dsv41(
++            q, k_cache, indices, topk_length, attn_sink, head_dim_v,
++            softmax_scale, extra_k_cache, extra_indices, extra_topk_length,
++        )
++    if _bpt != 584:
++        raise ValueError(
++            f"the flashinfer SM120 backend reads only the 584-byte V4 KV "
++            f"layout, got {_bpt} bytes/token, and the installed FlashInfer "
++            f"has no DSV4.1 kernel (need >= 0.7.1). Set "
+             f"SGLANG_SM120_FLASHMLA_BACKEND=triton to use the V4.1 layouts "
+             f"(SGLANG_DSV4_KV_LAYOUT=v41)."
+         )
+@@ -749,18 +805,27 @@
+     We split 256-token pages into 4 virtual 64-token pages.
+     Token indices are invariant under page-split (identity mapping).
+     """
+-    # Only the 584-byte V4 page is readable here: this path's page-split is
+-    # written for it (_PBS_SRC/_NOPE_ROPE_STRIDE above) and mis-reads a
+-    # 528/288-byte V4.1 cache silently -- an all-zero or garbage attention
+-    # output instead of an error (measured on SM121: page_size 128 -> zeros,
+-    # 256 -> 1.9e38). Fail loud; the V4.1 layouts need the Triton backend.
+-    if k_cache.shape[-1] != 584:
++    # DSV41_DECODE_ROUTE: the V4.1 mixed cache (528 B FP8 main + 288 B FP4
++    # extra) has a dedicated FlashInfer kernel since 0.7.1; route it there
++    # instead of the 584-byte page-split path below.
++    _bpt = k_cache.shape[-1]
++    if _bpt != 584:
++        if _bpt in (528, 288) and _flashinfer_supports_dsv41():
++            return _flash_mla_flashinfer_dsv41(
++                q, k_cache, indices, topk_length, attn_sink, head_dim_v,
++                softmax_scale, extra_k_cache, extra_indices, extra_topk_length,
++            )
+         raise ValueError(
+-            f"the flashinfer SM120 backend reads only the 584-byte V4 KV "
+-            f"layout, got {k_cache.shape[-1]} bytes/token. Set "
++            f"the flashinfer SM120 legacy page-split path reads only the "
++            f"584-byte V4 KV layout, got {_bpt} bytes/token. Set "
+             f"SGLANG_SM120_FLASHMLA_BACKEND=triton to use the V4.1 layouts "
+             f"(SGLANG_DSV4_KV_LAYOUT=v41)."
+         )
++    if k_cache.shape[-1] != 584:
++        raise ValueError(
++            f"the flashinfer SM120 legacy page-split path reads only the "
++            f"584-byte V4 KV layout, got {k_cache.shape[-1]} bytes/token."
++        )
+     from flashinfer.mla._sparse_mla_sm120 import (
+         _DECODE_MAX_TOKENS as _FI_DECODE_MAX_TOKENS,
+     )
+@@ -910,3 +975,102 @@
+         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+     )
+     return result.squeeze(1)
++
++
++# ---- DSV41_CAKE_ROUTE: FlashInfer >=0.7.1 V4.1 mixed-cache decode ----
++def _flash_mla_flashinfer_dsv41(
++    q,
++    k_cache,
++    indices,
++    topk_length,
++    attn_sink,
++    head_dim_v,
++    softmax_scale,
++    extra_k_cache,
++    extra_indices,
++    extra_topk_length,
++):
++    """FlashInfer SM120/SM121 DSV4.1 mixed-cache sparse MLA decode.
++
++    Uses the ``cake_dsv4`` kernel shipped since FlashInfer 0.7.1 (PR #5983):
++    a 528 B FP8 SWA main cache plus an optional 288 B FP4 compressed extra
++    cache. Selected through ``SparseMLASm120Wrapper`` with
++    ``kv_cache_format="fp8"``, ``kv_scale_format="ue8m0_g32"`` and
++    ``extra_kv_fp4=True``.
++
++    Verified on GB10 (sm121a) against our Triton reference: out cosine
++    similarity 0.999696; LSE differs only by a constant offset.
++    """
++    from flashinfer.mla._sparse_mla_sm120 import _api as _fi_api
++
++    q2 = q.squeeze(1) if q.ndim == 4 else q
++    num_tokens, num_heads, _ = q2.shape
++    dev = q2.device
++
++    main_bpt = k_cache.shape[-1]
++    extra_bpt = extra_k_cache.shape[-1] if extra_k_cache is not None else 0
++
++    # The wrapper caches per (heads, format) pair; build lazily and reuse.
++    global _DSV41_WRAPPER_CACHE
++    try:
++        _DSV41_WRAPPER_CACHE
++    except NameError:
++        _DSV41_WRAPPER_CACHE = {}
++
++    # DSV41_CACHE_KEY_FIX: the wrapper bakes in max_num_tokens at build time,
++    # so a cache keyed only on (heads, bpt) would hand back a wrapper that is
++    # too small for a longer batch. Key on the rounded token count too, and
++    # grow the ceiling in powers of two so a warm cache serves any batch.
++    _mt = 64
++    while _mt < num_tokens:
++        _mt *= 2
++    ckey = (num_heads, main_bpt, extra_bpt, _mt)
++    wrapper = _DSV41_WRAPPER_CACHE.get(ckey)
++    if wrapper is None:
++        wrapper = _fi_api.SparseMLASm120Wrapper(
++            max_num_tokens=_mt,
++            max_num_heads=num_heads,
++            kv_cache_format="fp8",
++            kv_scale_format="ue8m0_g32",
++            extra_kv_fp4=bool(extra_bpt),
++            device=dev,
++        )
++        _DSV41_WRAPPER_CACHE[ckey] = wrapper
++
++    # FlashInfer wants the flat uint8 cache exactly as stored.
++    kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
++    if kv_u8.ndim == 4:
++        # (pages, page_size, 1, bpt) -> (pages, page_bytes)
++        kv_u8 = kv_u8.reshape(kv_u8.shape[0], -1)
++    ex_u8 = None
++    if extra_k_cache is not None:
++        ex_u8 = (extra_k_cache.view(torch.uint8)
++                 if extra_k_cache.dtype != torch.uint8 else extra_k_cache)
++        if ex_u8.ndim == 4:
++            ex_u8 = ex_u8.reshape(ex_u8.shape[0], -1)
++
++    idx = indices.squeeze(1) if indices.dim() == 3 else indices
++    ex_idx = None
++    if extra_indices is not None:
++        ex_idx = (extra_indices.squeeze(1)
++                  if extra_indices.dim() == 3 else extra_indices)
++
++    out = torch.empty(num_tokens, num_heads, head_dim_v,
++                      dtype=torch.bfloat16, device=dev)
++    out_lse = torch.empty(num_tokens, num_heads,
++                          dtype=torch.float32, device=dev)
++
++    wrapper.run(
++        q2, kv_u8, idx, out, softmax_scale,
++        topk_length=topk_length,
++        attn_sink=attn_sink,
++        extra_kv_cache=ex_u8,
++        extra_indices=ex_idx,
++        extra_topk_length=extra_topk_length,
++        out_lse=out_lse,
++    )
++
++    if q.ndim == 4:
++        out = out.unsqueeze(1)
++        out_lse = out_lse.unsqueeze(1)
++    return out, out_lse
