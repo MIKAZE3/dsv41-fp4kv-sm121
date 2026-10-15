@@ -1,0 +1,35 @@
+# M3+M4 — 把两个 layout 显式传进 sm120 入口
+#
+# 文件: srt/layers/attention/deepseek_v4_backend.py
+# 位置: L3959-3970（flash_mla_with_kvcache_sm120 调用点）
+# 基线 md5: 201772b8577ff09d45facc6acd9ea76e
+#
+# 前置条件: M2 必须先打（入口要能接 kv_layout / extra_kv_layout 形参）
+# 依赖: M2
+# 被依赖: M1 需与本 patch 同批生效才有意义
+#
+# 行为保证（默认关闭）:
+#   extra_k_cache 为 None 时 extra_kv_layout 传 None；两个参数都只是
+#   "把 pool 已知的 layout 告诉 kernel"。V4 布局下 M2 的 torch 后端
+#   从 view 末维 584 也能得到同样结果，故默认路径输出不变。
+#   注意: extra_kv_layout 只在 extra cache 存在时取值，故 V4 主 + V4 副
+#   的老组合（副池 layout 也是 V4）行为一致。
+
+--- a/srt/layers/attention/deepseek_v4_backend.py
++++ b/srt/layers/attention/deepseek_v4_backend.py
+@@ -3967,6 +3967,15 @@
+                     extra_k_cache=extra_k_cache,
+                     extra_indices_in_kvcache=extra_indices,
+                     extra_topk_length=extra_topk_lengths,
++                    # The kernel detects each cache's format from the last dim
++                    # of its view; pass the layouts explicitly so the layout
++                    # never has to be re-derived from a byte count.
++                    kv_layout=token_to_kv_pool.get_swa_key_layout(),
++                    extra_kv_layout=(
++                        None
++                        if extra_k_cache is None
++                        else token_to_kv_pool.get_extra_key_layout(layer_id)
++                    ),
+                 )[0]
+             else:
+                 if _is_xpu:
