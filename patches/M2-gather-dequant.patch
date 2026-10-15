@@ -1,0 +1,373 @@
+# M2 — `_gather_and_dequant` layout 参数化 + V41 / V41_FP4 解包
+#
+# 文件: kernels/ops/attention/flash_mla_sm120.py
+# 基线 md5: aed9b0fe4958ad7e8c1245819c94acdb
+#
+# 前置条件: 无
+# 被依赖: M3（调用点显式传 layout）；M1 引用本 patch 新增的
+#          flash_mla_sm120_supports_v41_kv_layouts()
+#
+# 设计:
+#   1. `_gather_and_dequant(k_cache, indices, page_size, layout=None)` ——
+#      layout 默认 None ⇒ 从 view 末维推导（584/528/288 互不相同，无二义）。
+#      **不传 layout 的老调用点行为逐位不变**（V4 分支公式与原代码相同）。
+#   2. 全部常量从 KVLayout 派生（data_bytes / scale_bytes / tile_size），
+#      消除"两份独立常量"（L43 与 L392 各定义一遍）的漂移风险。
+#   3. V41: rope 已量化进 data 区 ⇒ 删 bf16 rope 分支，改单区 512 fp8
+#      × ue8m0（每 32 值 1 个 scale）。
+#   4. V41_FP4: 256 B 打包 e2m1（偶索引低半字节），32 个 e4m3 scale
+#      （每 16 值 1 个）。规则逐位复刻上游 Triton kernel
+#      dequant_k_cache.py:361-373 / 422-445，参考实现
+#      DSV41-TP4-Deploy/scripts/v41_ref_impl.py（absmax=2688 自校验通过）。
+#   5. 新增 flash_mla_sm120_supports_v41_kv_layouts() 供 M1 探测。
+#
+# ⚠ ue8m0 denormal（2026-10-14 修正，由 M5 测试暴露）:
+#   上游 dequant_k_cache.py:353 的**注释**说 byte 0 是 2^-126，但其**代码**
+#   `tl.full(..., 0x00400000, ...)` 是 2^-127，且 PyTorch 的
+#   float8_e8m0fnu view 也给出 2^-127。本 helper 一律按 2^-127（与代码、
+#   与 PyTorch view、与 M5 的 Triton 路径三方一致）。
+#   早期版本按注释用了 2^-126，导致每个 scale-byte-0 的 tile 差 2×；
+#   该 bug 只有拿上游 Triton kernel 做对照才能暴露（v41_ref_impl.py 本身
+#   也沿用了注释的 2^-126，故"与参考实现一致"不足以发现它）。
+#
+# 行为保证（默认关闭）:
+#   不设 SGLANG_DSV4_KV_LAYOUT ⇒ (V4, None) ⇒ view 末维 584 ⇒ V4 分支，
+#   偏移/字节/输出与现状一致。SM121 上 V4 的 payload 仍是 448 nope + 128 rope
+#   （本 patch 未改这一点）。
+#
+# ⚠ 范围声明: 本 patch 只覆盖 **torch fallback** 后端（SGLANG_SM120_FLASHMLA_BACKEND=torch）。
+#   flashinfer（默认）后端的 page-split 链仍需 M5（未交付，风险未验证）。
+#   ⇒ 启用 V41 必须同时设 SGLANG_SM120_FLASHMLA_BACKEND=torch。
+
+--- a/kernels/ops/attention/flash_mla_sm120.py
++++ b/kernels/ops/attention/flash_mla_sm120.py
+@@ -20,6 +20,7 @@
+ import triton
+ import triton.language as tl
+ 
++from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+ from sglang.srt.environ import envs
+ from sglang.srt.utils import is_hip
+ 
+@@ -46,8 +47,78 @@
+ _SCALE_STRIDE = _NUM_TILES + 1  # 8 (7 scales + 1 pad)
+ _D = _NOPE_DIM + _ROPE_DIM  # 512
+ 
+-
+-def _gather_and_dequant(k_cache, indices, page_size):
++# Reader contract (kv_layout.py): a (pages, page_size, 1, bytes) view is decoded
++# from its last dim alone. 584 / 528 / 288 are distinct, so the view identifies
++# the layout with no extra plumbing from the pool.
++_LAYOUT_BY_BYTES = {
++    KVLayout.V4.bytes_per_token: KVLayout.V4,
++    KVLayout.V41.bytes_per_token: KVLayout.V41,
++    KVLayout.V41_FP4.bytes_per_token: KVLayout.V41_FP4,
++}
++
++
++def flash_mla_sm120_supports_v41_kv_layouts() -> bool:
++    """Whether the *selected backend* can read the V4.1 paged formats
++    (V41 528 B main and V41_FP4 288 B extra).
++
++    Only the Triton backend understands them: its ``_run_triton_sparse_decode``
++    dispatches on the layout carried by the view's last dim, so no prebuilt .so
++    is involved (SM121 has no flashmla_ops.so and never needs one). The
++    FlashInfer backend's page-split is written for the 584-byte V4 page and
++    fails loud on anything else, so it must not advertise V4.1 support -- with
++    ``auto`` the probe would otherwise pick V41 and crash at the first decode.
++    """
++    return _sm120_default_backend == "triton"
++
++
++def _kv_layout_of(k_cache) -> KVLayout:
++    """Layout of a (pages, page_size, 1, bytes) cache view, from its last dim."""
++    bpt = k_cache.shape[-1]
++    layout = _LAYOUT_BY_BYTES.get(bpt)
++    if layout is None:
++        raise ValueError(
++            f"unsupported DSV4 KV cache bytes-per-token {bpt}; expected one of "
++            f"{sorted(_LAYOUT_BY_BYTES)}"
++        )
++    return layout
++
++
++def _e2m1_code_to_f32(code: torch.Tensor) -> torch.Tensor:
++    """e2m1 code (0..15) -> float32, bit-identical to the upstream Triton kernel.
++
++    dequant_k_cache.py:361-373: ``m = code & 7; e = m >> 1; f = m & 1`` and
++    ``mag = (e == 0) ? 0.5*f : 2^(e-1) * (1 + 0.5*f)``, then the sign is OR-ed
++    in as an integer bitcast, which preserves -0.0 (code 0x8).
++    """
++    m = code & 7
++    e = m >> 1
++    f = (m & 1).to(torch.float32)
++    mag = torch.where(
++        e == 0, 0.5 * f, torch.exp2((e - 1).to(torch.float32)) * (1.0 + 0.5 * f)
++    )
++    mag_bits = mag.view(torch.int32)
++    sign = (code & 8).to(torch.int32) << 28
++    return (mag_bits | sign).view(torch.float32)
++
++
++def _ue8m0_scale_to_f32(u8: torch.Tensor) -> torch.Tensor:
++    """ue8m0 scale byte -> float32, bit-identical to dequant_k_cache.py:349-358.
++
++    ``_ue8m0_to_fp32`` builds the value from the exponent bits, so every byte
++    decodes to exactly ``2 ** (byte - 127)`` and byte 0 is the denormal
++    ``2 ** -127`` (0x00400000), byte 255 NaN. The upstream *docstring* says
++    byte 0 is 2**-126, but its *code* emits 0x00400000 and the code is what
++    runs -- an earlier revision of this helper followed the docstring and was
++    off by 2x on every scale-byte-0 tile. The M5 addressing test compares
++    against the upstream Triton kernel and catches exactly that.
++    """
++    u = u8.to(torch.int32)
++    normal = torch.exp2((u - 127).to(torch.float32))
++    out = torch.where(u == 0, torch.full_like(normal, 2.0**-127), normal)
++    return torch.where(u == 255, torch.full_like(out, float("nan")), out)
++
++
++def _gather_and_dequant(k_cache, indices, page_size, layout=None):
+     """Gather KV entries from the paged buffer using correct page-internal addressing.
+ 
+     Args:
+@@ -55,10 +126,25 @@
+                  Non-contiguous view of the raw page buffer.
+         indices: (...) int32/int64, token-level indices. -1 = invalid.
+         page_size: tokens per page (256)
++        layout: KVLayout of this cache. None derives it from the view's last
++            dim. V4 (584 B) keeps 448 fp8 nope + 128 B bf16 rope with 7 ue8m0
++            scales. V41 (528 B) quantizes the rope too: 512 fp8, 16 ue8m0
++            scales per 32 values. V41_FP4 (288 B, extra cache only) packs 512
++            e2m1 values two per byte with 32 e4m3 scales per 16 values.
+ 
+     Returns:
+         kv: (..., _D) bfloat16, dequantized KV vectors
+     """
++    layout = _kv_layout_of(k_cache) if layout is None else KVLayout.parse(layout)
++    data_bytes = layout.data_bytes  # 576 / 512 / 256 payload bytes per token
++    scale_stride = layout.scale_bytes  # 8 / 16 / 32 scale-row bytes per token
++    tile = layout.tile_size  # 64 / 32 / 16 values sharing one scale
++    # V4 keeps its rope beside the nope values instead of quantizing it, so its
++    # payload is the 448 nope bytes and the rope is gathered separately below.
++    payload_bytes = _NOPE_DIM if layout is KVLayout.V4 else data_bytes
++    values_per_byte = 2 if layout.is_fp4 else 1
++    num_scales = payload_bytes * values_per_byte // tile  # 7 / 16 / 32
++
+     idx_shape = indices.shape
+     flat_idx = indices.reshape(-1)  # (N,)
+     N = flat_idx.shape[0]
+@@ -82,53 +168,82 @@
+     # Note: float8_e4m3fn and uint8 are both 1 byte, view is safe
+ 
+     # Compute byte offsets within each page
+-    # NOPE: page[safe_page, safe_offset * 576 + 0:448]
+-    # ROPE: page[safe_page, safe_offset * 576 + 448:576]
+-    # SCALES: page[safe_page, page_size * 576 + safe_offset * 8 + 0:7]
+-
+-    nope_base = safe_offsets * _NOPE_ROPE_STRIDE  # (N,)
++    # DATA:   page[safe_page, safe_offset * data_bytes + 0:payload_bytes]
++    # SCALES: page[safe_page, page_size * data_bytes
++    #              + safe_offset * scale_stride + 0:num_scales]
++
++    nope_base = safe_offsets * data_bytes  # (N,)
+     nope_offsets = nope_base.unsqueeze(-1) + torch.arange(
+-        _NOPE_DIM, device=device, dtype=torch.long
+-    )  # (N, 448)
+-
+-    rope_base = nope_base + _NOPE_DIM  # (N,)
+-    rope_offsets = rope_base.unsqueeze(-1) + torch.arange(
+-        _ROPE_DIM * 2, device=device, dtype=torch.long
+-    )  # (N, 128)
+-
+-    scale_section_offset = page_size * _NOPE_ROPE_STRIDE  # 147456
+-    scale_base = scale_section_offset + safe_offsets * _SCALE_STRIDE  # (N,)
++        payload_bytes, device=device, dtype=torch.long
++    )  # (N, payload_bytes)
++
++    scale_section_offset = page_size * data_bytes
++    scale_base = scale_section_offset + safe_offsets * scale_stride  # (N,)
+     scale_offsets = scale_base.unsqueeze(-1) + torch.arange(
+-        _NUM_TILES, device=device, dtype=torch.long
+-    )  # (N, 7)
++        num_scales, device=device, dtype=torch.long
++    )  # (N, num_scales)
+ 
+     # Gather bytes per page — use advanced indexing
+-    # raw_pages[safe_pages, nope_offsets] → (N, 448)
++    # raw_pages[safe_pages, nope_offsets] → (N, payload_bytes)
+     page_idx_nope = safe_pages.unsqueeze(-1).expand_as(nope_offsets)
+-    nope_bytes = raw_pages[page_idx_nope, nope_offsets]  # (N, 448) uint8
+-
+-    page_idx_rope = safe_pages.unsqueeze(-1).expand_as(rope_offsets)
+-    rope_bytes = raw_pages[page_idx_rope, rope_offsets]  # (N, 128) uint8
++    nope_bytes = raw_pages[page_idx_nope, nope_offsets]  # (N, payload_bytes) uint8
+ 
+     page_idx_scale = safe_pages.unsqueeze(-1).expand_as(scale_offsets)
+-    scale_bytes = raw_pages[page_idx_scale, scale_offsets]  # (N, 7) uint8
+-
+-    # Reinterpret dtypes
+-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, 448)
+-    rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, 64)
+-    scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (N, 7)
+-
+-    # Dequantize: nope_tile * scale_tile → bf16 (vectorized)
++    scale_bytes_g = raw_pages[page_idx_scale, scale_offsets]  # (N, num_scales) uint8
++
++    # Dequantize tile by tile → bf16 (vectorized)
+     result = torch.empty(N, _D, dtype=torch.bfloat16, device=device)
+-    result[:, :_NOPE_DIM] = (
+-        (
+-            nope_fp8.view(N, _NUM_TILES, _TILE_SIZE).float()
+-            * scale_e8m0.view(N, _NUM_TILES, 1).float()
+-        )
+-        .view(N, _NOPE_DIM)
+-        .to(torch.bfloat16)
+-    )
+-    result[:, _NOPE_DIM:] = rope_bf16
++    if layout is KVLayout.V4:
++        rope_base = nope_base + _NOPE_DIM  # (N,)
++        rope_offsets = rope_base.unsqueeze(-1) + torch.arange(
++            _ROPE_DIM * 2, device=device, dtype=torch.long
++        )  # (N, 128)
++        page_idx_rope = safe_pages.unsqueeze(-1).expand_as(rope_offsets)
++        rope_bytes = raw_pages[page_idx_rope, rope_offsets]  # (N, 128) uint8
++
++        nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, 448)
++        rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, 64)
++        scale_e8m0 = scale_bytes_g.view(torch.float8_e8m0fnu)  # (N, 7)
++
++        result[:, :_NOPE_DIM] = (
++            (
++                (
++                    nope_fp8.view(N, _NUM_TILES, _TILE_SIZE).float()
++                    * scale_e8m0.view(N, _NUM_TILES, 1).float()
++                )
++                .view(N, _NOPE_DIM)
++                .to(torch.bfloat16)
++            )
++        )
++        result[:, _NOPE_DIM:] = rope_bf16
++    elif layout is KVLayout.V41:
++        # 512 fp8 (rope quantized too), 16 ue8m0 scales per 32 values.
++        vals = nope_bytes.view(torch.float8_e4m3fn).view(N, data_bytes).float()
++        scale_f32 = (
++            _ue8m0_scale_to_f32(scale_bytes_g)
++            .view(N, num_scales, 1)
++            .expand(N, num_scales, tile)
++            .reshape(N, data_bytes)
++        )
++        result[:, :_D] = (vals * scale_f32).to(torch.bfloat16)
++    else:
++        # V41_FP4: 512 e2m1 values packed two per byte (even index in the low
++        # nibble), 32 e4m3 scales per 16 values == per 8 payload bytes.
++        packed = nope_bytes.view(N, data_bytes).to(torch.int32)  # (N, 256)
++        lo = _e2m1_code_to_f32(packed & 0xF)  # -> even output index
++        hi = _e2m1_code_to_f32(packed >> 4)  # -> odd output index
++        scale_f32 = (
++            scale_bytes_g.view(torch.float8_e4m3fn)
++            .view(N, num_scales, 1)
++            .float()
++            .expand(N, num_scales, tile // 2)
++            .reshape(N, data_bytes)
++        )
++        result[:, :_D] = (
++            torch.stack([lo * scale_f32, hi * scale_f32], dim=-1)
++            .reshape(N, data_bytes * 2)
++            .to(torch.bfloat16)
++        )
+ 
+     return result.reshape(*idx_shape, _D)
+ 
+@@ -144,6 +259,8 @@
+     extra_k_cache=None,
+     extra_indices=None,
+     extra_topk_length=None,
++    kv_layout=None,
++    extra_kv_layout=None,
+ ):
+     B, s_q, H_q, D_qk = q.shape
+     num_pages, page_size, H_k, bpt = k_cache.shape
+@@ -156,8 +273,11 @@
+         topk_range = torch.arange(topk, device=topk_length.device).view(1, 1, topk)
+         invalid_mask = invalid_mask | (topk_range >= topk_length.view(B, 1, 1))
+ 
+-    # Gather and dequantize using page-aware addressing
+-    gathered_kv = _gather_and_dequant(k_cache, safe_indices, page_size)
++    # Gather and dequantize using page-aware addressing. The layout comes from
++    # the caller when it knows it, otherwise from the view's last dim.
++    gathered_kv = _gather_and_dequant(
++        k_cache, safe_indices, page_size, layout=kv_layout
++    )
+ 
+     if extra_k_cache is not None and extra_indices is not None:
+         extra_topk = extra_indices.shape[-1]
+@@ -171,7 +291,9 @@
+             extra_invalid = extra_invalid | (
+                 extra_range >= extra_topk_length.view(B, 1, 1)
+             )
+-        extra_kv = _gather_and_dequant(extra_k_cache, extra_safe, extra_page_size)
++        extra_kv = _gather_and_dequant(
++            extra_k_cache, extra_safe, extra_page_size, layout=extra_kv_layout
++        )
+         gathered_kv = torch.cat([gathered_kv, extra_kv], dim=2)
+         invalid_mask = torch.cat([invalid_mask, extra_invalid], dim=2)
+ 
+@@ -224,6 +346,18 @@
+     extra_indices,
+     extra_topk_length,
+ ):
++    # Only the 584-byte V4 page is readable here: this path's page-split is
++    # written for it (_PBS_SRC/_NOPE_ROPE_STRIDE above) and mis-reads a
++    # 528/288-byte V4.1 cache silently -- an all-zero or garbage attention
++    # output instead of an error (measured on SM121: page_size 128 -> zeros,
++    # 256 -> 1.9e38). Fail loud; the V4.1 layouts need the Triton backend.
++    if k_cache.shape[-1] != 584:
++        raise ValueError(
++            f"the flashinfer SM120 backend reads only the 584-byte V4 KV "
++            f"layout, got {k_cache.shape[-1]} bytes/token. Set "
++            f"SGLANG_SM120_FLASHMLA_BACKEND=triton to use the V4.1 layouts "
++            f"(SGLANG_DSV4_KV_LAYOUT=v41)."
++        )
+     from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+ 
+     q2 = q.squeeze(1) if q.ndim == 4 else q
+@@ -320,6 +454,11 @@
+     extra_k_cache = kwargs.get("extra_k_cache")
+     extra_indices = kwargs.get("extra_indices_in_kvcache")
+     extra_topk_length = kwargs.get("extra_topk_length")
++    # Layout of each cache, or None to derive it from the view's last dim.
++    # Only the PyTorch fallback consumes them today; the FlashInfer path keeps
++    # the 584-byte layout until it is parameterized.
++    kv_layout = kwargs.get("kv_layout")
++    extra_kv_layout = kwargs.get("extra_kv_layout")
+ 
+     if _sm120_default_backend == "flashinfer":
+         if q.shape[0] > SM120_DECODE_MAX_TOKENS:
+@@ -378,6 +517,8 @@
+         extra_k_cache,
+         extra_indices,
+         extra_topk_length,
++        kv_layout,
++        extra_kv_layout,
+     )
+     return (out, lse)
+ 
+@@ -608,6 +749,18 @@
+     We split 256-token pages into 4 virtual 64-token pages.
+     Token indices are invariant under page-split (identity mapping).
+     """
++    # Only the 584-byte V4 page is readable here: this path's page-split is
++    # written for it (_PBS_SRC/_NOPE_ROPE_STRIDE above) and mis-reads a
++    # 528/288-byte V4.1 cache silently -- an all-zero or garbage attention
++    # output instead of an error (measured on SM121: page_size 128 -> zeros,
++    # 256 -> 1.9e38). Fail loud; the V4.1 layouts need the Triton backend.
++    if k_cache.shape[-1] != 584:
++        raise ValueError(
++            f"the flashinfer SM120 backend reads only the 584-byte V4 KV "
++            f"layout, got {k_cache.shape[-1]} bytes/token. Set "
++            f"SGLANG_SM120_FLASHMLA_BACKEND=triton to use the V4.1 layouts "
++            f"(SGLANG_DSV4_KV_LAYOUT=v41)."
++        )
+     from flashinfer.mla._sparse_mla_sm120 import (
+         _DECODE_MAX_TOKENS as _FI_DECODE_MAX_TOKENS,
+     )
