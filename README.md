@@ -13,24 +13,24 @@ V4 layout (584 B/token) to the official V4.1 layouts — **528 B FP8 main (SWA) 
 
 ## Speed comparison vs the MiaAI-Lab TP4 baseline
 
-Same 4× DGX Spark cluster, same sparkDash-style prompts (greedy, 256 completion
-tokens), aggregate tok/s with per-stream in brackets:
+Same 4× DGX Spark cluster, same benchmark (greedy, code prompts, 800 completion
+tokens, 1/2/4/8/16 streams, first two runs discarded, measured 2026-11-02).
+Aggregate tok/s with per-stream in brackets:
 
-| prompt type | MiaAI TP4 baseline<br>(V4 KV, 584 B/tok) | **This work**<br>(V41+FP4 KV, 912 B/tok avg) |
-|---|---:|---:|
-| prose c1 (1 stream) | 87.7 | 72.9* |
-| prose c16 (16 streams, aggregate) | 342.7 | ~400 (observed) |
-| prefill 16k–128k | 4.9k–5.0k tok/s | (not re-measured) |
-| KV capacity | 6.56 M tokens | **12.77 M tokens** (**+94%**) |
-| KV bytes per full token | 1670.75 | **912.25** (−45%) |
-| qeval | 72/75 | 71/75 |
+| streams | MiaAI TP4 baseline<br>(V4 KV, 584 B/tok) | **This work**<br>(V41+FP4 KV, 912 B/tok avg) | Δ |
+|---|---:|---:|---:|
+| c1 (1 stream) | 124.8 | **127.8** | **+2.4%** |
+| c2 (2 streams) | 175.0 | **171.1** | −2.2% |
+| c4 (4 streams) | 246.8 | **198.1** | −19.7% |
+| c8 (8 streams) | 309.8 | **272.7** | −12.0% |
+| c16 (16 streams) | 438.3 | **426.1** | −2.8% |
 
-\* c1 figure from a 64-token smoke probe (72.9 tok/s), not the full sparkDash
-protocol — treat as indicative. The headline win is **capacity**: the same
-~12.2 GB KV budget that held 6.56 M V4 tokens now holds 12.77 M V4.1 tokens.
+TTFT: 235 ms (c1) → 546 ms (c16).
 
-Decode step time: 32.98 → 33.63 ms (**+2.0%**) despite reading 45% fewer KV
-bytes per token — the flashinfer cake_dsv4 kernel recovers most of that cost.
+The headline win is **capacity**: the same ~12.2 GB KV budget that held
+6.56 M V4 tokens now holds 12.77 M V4.1 tokens (**+94%**). Decode throughput
+holds within a few percent of baseline at c1/c2/c16 and costs more at mid
+concurrency (c4) — while every request can now reference 2× the context.
 
 ## Results detail (measured on the reference cluster)
 
